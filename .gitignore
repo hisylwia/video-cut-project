@@ -1,0 +1,3 @@
+__pycache__/
+*.pyc
+video_clips/constants.py
