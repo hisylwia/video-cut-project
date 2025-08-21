@@ -1,0 +1,1 @@
+web: uvicorn video_clips.app:app --host 0.0.0.0 --port $PORT
