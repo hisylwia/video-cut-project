@@ -8,12 +8,14 @@ API_URL = "http://localhost:8000"
 
 def process_video(duration, emotion, number_of_videos, video_link):
     payload = {
-        "duration": duration,
-        "emotion": emotion,
-        "number_of_videos": number_of_videos,
-        "video_link": video_link
+        "states": {
+            "duration": duration,
+            "emotion": emotion,
+            "number_of_videos": number_of_videos,
+            "video_link": video_link
+        }
     }
-
+    
     # FastAPI /requirements endpoint'ine POST isteği
     response = requests.post(f"{API_URL}/requirements", json=payload)
     
