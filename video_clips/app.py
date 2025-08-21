@@ -5,14 +5,14 @@ import os
 import subprocess
 import shutil
 import cv2
-import librosa
 import numpy as np
 import yt_dlp
 import base64
 import requests
 import json
-import base64
 import re
+import zipfile
+import mediapipe as mp
 from constants import GEMINI_API_KEY, GEMINI_API_URL
 
 
@@ -39,7 +39,6 @@ Requirements for each segment:
 
 
 app = FastAPI()
-emotion = ''
 CANDIDATE_LABELS = ["mutlu", "üzücü", "öfkeli", "korkunç", "şaşırtıcı", "eğlenceli", "bilgilendirici", "heyecanlı"]
 
  
@@ -47,13 +46,20 @@ CANDIDATE_LABELS = ["mutlu", "üzücü", "öfkeli", "korkunç", "şaşırtıcı"
 def download_youtube_video(url, output_dir = "temp_outputs"):
     os.makedirs(output_dir, exist_ok = True)
     output_path = os.path.join(output_dir, "input.mp4")
+
     ydl_opts = {
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4',
-        'outtmpl': output_path
+        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "outtmpl": output_path,
+        "merge_output_format": "mp4"
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+    except Exception as e:
+        print("Video indirme hatası:", e)
+        return None
+    
     return output_path
 
 
@@ -187,53 +193,17 @@ def emotion_score(text: str, emotion: str) -> float:
         return 0.0
 
 
-def opencv_motion_score(video_path):
-    cap = cv2.VideoCapture(video_path)
-    ret, prev_frame = cap.read()
+def compute_total_scores(video_path, transcript_segments, emotion):
 
-    if not ret:
-        cap.release()
-        return np.array([])
-    
-    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
-    scores = []
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        diff = cv2.absdiff(prev_gray, gray)
-        scores.append(diff.sum())
-        prev_gray = gray
-    cap.release()
-    
-    scores = np.array(scores)
-    if scores.max() > 0:
-        scores = scores / scores.max()
-
-    return scores
-
-def librosa_audio_score(audio_path):
-    y, sr = librosa.load(audio_path, sr = None, mono = True)
-    rms = librosa.feature.rms(y=y)[0]
-    if rms.max() > 0:
-        rms = rms / rms.max()
-    return rms
-
-def compute_total_scores(video_path, audio_path, transcript_segments, emotion):
-    motion_scores = opencv_motion_score(video_path)
-    audio_scores = librosa_audio_score(audio_path)
-
-    
     bert_scores = []
     for seg in transcript_segments:
         score = emotion_score(seg['text'], emotion)
         bert_scores.append({'start': seg['start'], 'end': seg['end'], 'score': score})
 
-    
-    frame_count = len(motion_scores)
     cap = cv2.VideoCapture(video_path)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
 
     total_scores = []
 
@@ -244,8 +214,7 @@ def compute_total_scores(video_path, audio_path, transcript_segments, emotion):
         for seg in bert_scores:
             if seg['start'] <= t <= seg['end']:
                 b_score = seg['score']
-        total = motion_scores[i] + audio_scores[min(i, len(audio_scores)-1)] + b_score
-        total_scores.append(total)
+        total_scores.append(b_score)
 
     return np.array(total_scores), fps
 
@@ -289,6 +258,54 @@ def cut_video(video_path, start_time, end_time, output_path):
                     ])
     
 
+def make_vertical(input_path, output_path, target_width=1080, target_height=1920, alpha=0.2):
+    cap = cv2.VideoCapture(input_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps,
+                          (target_width, target_height))
+    mp_pose = mp.solutions.pose
+    pose = mp_pose.Pose(static_image_mode=False,
+                        min_detection_confidence=0.5)
+    ema_center_x = None
+    ema_center_y = None
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(rgb)
+        if results.pose_landmarks:
+            lm = results.pose_landmarks.landmark
+            x_coords = [lm[i].x for i in range(len(lm))]
+            y_coords = [lm[i].y for i in range(len(lm))]
+            center_x = int(np.mean(x_coords) * frame.shape[1])
+            center_y = int(np.mean(y_coords) * frame.shape[0])
+        else:
+            center_x = frame.shape[1] // 2
+            center_y = frame.shape[0] // 2
+        if ema_center_x is None:
+            ema_center_x = center_x
+            ema_center_y = center_y
+        else:
+            ema_center_x = int(alpha * center_x +
+                               (1 - alpha) * ema_center_x)
+            ema_center_y = int(alpha * center_y +
+                               (1 - alpha) * ema_center_y)
+        start_x = max(0, ema_center_x - target_width // 2)
+        start_y = max(0, ema_center_y - target_height // 2)
+        if start_x + target_width > frame.shape[1]:
+            start_x = frame.shape[1] - target_width
+        if start_y + target_height > frame.shape[0]:
+            start_y = frame.shape[0] - target_height
+        crop_frame = frame[start_y:start_y+target_height,
+                           start_x:start_x+target_width]
+        crop_frame = cv2.resize(crop_frame, (target_width, target_height))
+        out.write(crop_frame)
+    cap.release()
+    out.release()
+    
+
 
 @app.post("/requirements")
 async def require(states: dict = Body(..., embed=True)):
@@ -298,7 +315,6 @@ async def require(states: dict = Body(..., embed=True)):
     number_of_videos = states["number_of_videos"]
     video_link = states["video_link"]
 
-    print({"seconds": seconds, "emotion": emotion, "video_link": video_link})
     
     if os.path.exists("temp_outputs"):
         shutil.rmtree("temp_outputs")
@@ -309,25 +325,28 @@ async def require(states: dict = Body(..., embed=True)):
     extract_audio(video_path, audio_path)
     transcript_segments = transcript(audio_path)
 
-    total_scores, fps = compute_total_scores(video_path, audio_path, transcript_segments, emotion)
+    total_scores, fps = compute_total_scores(video_path, transcript_segments, emotion)
     highlights = get_highlights(total_scores, fps, seconds, number_of_videos)
 
     output_dir = "temp_outputs/results" 
     os.makedirs(output_dir, exist_ok=True) 
 
     output_files = []
+    
     for idx, (start_time, end_time) in enumerate(highlights):
-        output_path = os.path.join(output_dir, f"result_{idx}.mp4")
-        cut_video(video_path, start_time, end_time, output_path)
-        if os.path.exists(output_path):
-            output_files.append(output_path)
+        raw_output = os.path.join(output_dir, f"raw_{idx}.mp4")
+        final_output = os.path.join(output_dir, f"result_{idx}.mp4")
+        cut_video(video_path, start_time, end_time, raw_output)
+        make_vertical(raw_output, final_output)
+
+        if os.path.exists(final_output):
+            output_files.append(final_output)
 
 
     zip_path = "temp_outputs/results.zip"
     if os.path.exists(zip_path):
         os.remove(zip_path)
 
-    import zipfile
     with zipfile.ZipFile(zip_path, 'w') as zipf:
         for idx, file in enumerate(output_files):
             zipf.write(file, f"result_{idx}.mp4")
@@ -335,9 +354,6 @@ async def require(states: dict = Body(..., embed=True)):
 
     return {"segments": transcript_segments}
 
-
-
-from fastapi.responses import FileResponse
 
 ZIP_PATH = "temp_outputs/results.zip" 
 
